@@ -246,6 +246,21 @@ bool RadioSimulation::_process_radio(
         if (!srcPair.second.source || !srcPair.second.source->isActive() || (sampleCache.find(srcPair.second.source.get()) == sampleCache.end())) {
             continue;
         }
+        for (const afv::dto::RxTransceiver &tx: srcPair.second.transceivers) {
+            if (tx.Frequency == mRadioState[rxIter].Frequency) {
+                concurrentStreams++;
+                break;
+            }
+        }
+    }
+
+    const float targetAutoGain = getAutoOutputGainMultiplier(static_cast<int>(concurrentStreams));
+    mRadioState[rxIter].CurrentAutoGain = smoothAutoOutputGain(mRadioState[rxIter].CurrentAutoGain, targetAutoGain);
+
+    for (auto &srcPair: (onHeadset ? mHeadsetIncomingStreams : mSpeakerIncomingStreams)) {
+        if (!srcPair.second.source || !srcPair.second.source->isActive() || (sampleCache.find(srcPair.second.source.get()) == sampleCache.end())) {
+            continue;
+        }
         bool mUseStream = false;
         float voiceGain = 1.0f;
         for (const afv::dto::RxTransceiver &tx: srcPair.second.transceivers) {
@@ -290,8 +305,7 @@ bool RadioSimulation::_process_radio(
                 mix_buffers(
                             state->mChannelBuffer,
                             sampleCache.at(srcPair.second.source.get()),
-                            voiceGain * mRadioState[rxIter].Gain);
-                concurrentStreams++;
+                            voiceGain * mRadioState[rxIter].Gain * mRadioState[rxIter].CurrentAutoGain);
             } catch (const std::out_of_range &) {
                 LOG("RadioSimulation", "internal error:  Tried to mix uncached stream");
             }
@@ -507,6 +521,36 @@ void RadioSimulation::setTxRadio(unsigned int radio)
 void RadioSimulation::setMicrophoneVolume(float volume)
 {
     mMicVolume = volume;
+}
+
+void RadioSimulation::setAutoOutputGain(bool enableAutoOutputGain)
+{
+    mAutoOutputGain = enableAutoOutputGain;
+}
+
+void RadioSimulation::setAutoOutputGainStrength(float strength)
+{
+    mAutoOutputGainStrength = fmax(0.0f, fmin(1.0f, strength));
+}
+
+float RadioSimulation::getAutoOutputGainMultiplier(int concurrentStreams) const
+{
+    if (!mAutoOutputGain || concurrentStreams <= 1) {
+        return 1.0f;
+    }
+
+    const float scaledStreams = static_cast<float>(concurrentStreams - 1);
+    const float attenuation = 0.22f * mAutoOutputGainStrength * scaledStreams;
+    const float floor = 1.0f - (0.55f * mAutoOutputGainStrength);
+    return fmax(floor, 1.0f - attenuation);
+}
+
+float RadioSimulation::smoothAutoOutputGain(float currentGain, float targetGain) const
+{
+    const float attack = 0.35f;
+    const float release = 0.12f;
+    const float factor = targetGain < currentGain ? attack : release;
+    return currentGain + ((targetGain - currentGain) * factor);
 }
 
 void RadioSimulation::dtoHandler(const std::string &dtoName, const unsigned char *bufIn, size_t bufLen, void *user_data)

@@ -85,7 +85,7 @@ namespace afv_native {
          */
         class RadioState {
         public:
-            unsigned int Frequency;
+            unsigned int Frequency = 0;
             float Gain = 1.0;
             std::shared_ptr<audio::RecordedSampleSource> Click;
             std::shared_ptr<audio::RecordedSampleSource> Crackle;
@@ -95,11 +95,12 @@ namespace afv_native {
             std::shared_ptr<audio::SineToneSource> BlockTone;
             audio::SimpleCompressorEffect simpleCompressorEffect;
             audio::VHFFilterSource vhfFilter;
-            int mLastRxCount;
-            bool mBypassEffects;
-            bool mHfSquelch;
-            bool mIsReceiving;
+            int mLastRxCount = 0;
+            bool mBypassEffects = false;
+            bool mHfSquelch = false;
+            bool mIsReceiving = false;
             bool onHeadset = true;
+            float CurrentAutoGain = 1.0f;
         };
 
         /** CallsignMeta is the per-packetstream metadata stored within the RadioSimulation object.
@@ -168,6 +169,8 @@ namespace afv_native {
 
             void setEnableOutputEffects(bool enableEffects);
             void setEnableHfSquelch(bool enableHfSquelch);
+            void setAutoOutputGain(bool enableAutoOutputGain);
+            void setAutoOutputGainStrength(float strength);
 
             void setupDevices(util::ChainedCallback<void(ClientEventType, void*, void*)> *eventCallback);
 
@@ -225,6 +228,8 @@ namespace afv_native {
             std::shared_ptr<OutputDeviceState> mSpeakerState;
 
             float mMicVolume = 1.0f;
+            bool mAutoOutputGain = true;
+            float mAutoOutputGainStrength = 0.6f;
 
             unsigned int mLastReceivedRadio;
 
@@ -248,6 +253,8 @@ namespace afv_native {
                     const std::string &dtoName, const unsigned char *bufIn, size_t bufLen);
 
             void maintainIncomingStreams();
+            float getAutoOutputGainMultiplier(int concurrentStreams) const;
+            float smoothAutoOutputGain(float currentGain, float targetGain) const;
         private:
             bool _process_radio(
                     const std::map<void *, audio::SampleType[audio::frameSizeSamples]> &sampleCache,

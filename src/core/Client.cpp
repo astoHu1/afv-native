@@ -568,6 +568,16 @@ void Client::setEnableHfSquelch(bool enableSquelch)
     mRadioSim->setEnableHfSquelch(enableSquelch);
 }
 
+void Client::setAutoOutputGain(bool enableAutoOutputGain)
+{
+    mRadioSim->setAutoOutputGain(enableAutoOutputGain);
+}
+
+void Client::setAutoOutputGainStrength(float strength)
+{
+    mRadioSim->setAutoOutputGainStrength(strength);
+}
+
 void Client::setOnHeadset(unsigned int radio, bool onHeadset)
 {
     mRadioSim->setOnHeadset(radio, onHeadset);

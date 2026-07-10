@@ -193,6 +193,8 @@ namespace afv_native {
         void setEnableInputFilters(bool enableInputFilters);
         void setEnableOutputEffects(bool enableEffects);
         void setEnableHfSquelch(bool enableSquelch);
+        void setAutoOutputGain(bool enableAutoOutputGain);
+        void setAutoOutputGainStrength(float strength);
 
         void setOnHeadset(unsigned int radio, bool onHeadset);
         void setSplitAudioChannels(bool split);
