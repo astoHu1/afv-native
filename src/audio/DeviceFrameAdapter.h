@@ -63,7 +63,7 @@ public:
                 }
                 mPlaybackOffset = 0;
             }
-            const auto count = std::min(frames, frameSizeSamples - mPlaybackOffset);
+            const auto count = (std::min)(frames, frameSizeSamples - mPlaybackOffset);
             std::copy_n(mPlayback.data() + mPlaybackOffset * channels,
                         count * channels, output);
             output += count * channels;
@@ -89,7 +89,7 @@ public:
         }
 
         while (frames > 0) {
-            const auto count = std::min(frames, frameSizeSamples - mCaptureSize);
+            const auto count = (std::min)(frames, frameSizeSamples - mCaptureSize);
             if (channels == 1) {
                 std::copy_n(input, count, mCapture.data() + mCaptureSize);
             } else {
