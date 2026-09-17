@@ -1,3 +1,4 @@
+#define MINIAUDIO_IMPLEMENTATION
 #include "MiniAudioAudioDevice.h"
 
 #include <algorithm>
@@ -23,54 +24,104 @@ MiniAudioAudioDevice::MiniAudioAudioDevice(
     AudioDevice(),
     mUserStreamName(userStreamName),
     mDeviceName(deviceName),
+    mContextInitialized(false),
     mDeviceInitialized(false),
     mSplitChannels(splitChannels)
 {
+}
+
+bool MiniAudioAudioDevice::initContext()
+{
+    if (mContextInitialized)
+        return true;
+
     ma_context_config contextConfig = ma_context_config_init();
     contextConfig.threadPriority = ma_thread_priority_normal;
     contextConfig.jack.pClientName = "xpilot";
     contextConfig.pulse.pApplicationName = "xpilot";
     ma_result result = ma_context_init(NULL, 0, &contextConfig, &context);
     if(result == MA_SUCCESS) {
+        mContextInitialized = true;
         ma_log_register_callback(ma_context_get_log(&context), ma_log_callback_init(logger, NULL));
         LOG("MiniAudioAudioDevice", "Context initialized. Audio Backend: %s", ma_get_backend_name(context.backend));
     }
     else {
         LOG("MiniAudioAudioDevice", "Error initializing context: %s", ma_result_description(result));
     }
+    return mContextInitialized;
 }
 
 MiniAudioAudioDevice::~MiniAudioAudioDevice()
 {
-
+    close();
 }
 
 bool MiniAudioAudioDevice::openOutput()
 {
-    return initOutput();
+    std::lock_guard<std::mutex> lifecycleGuard(mLifecycleLock);
+    return initDevice(ma_device_type_playback);
 }
 
 bool MiniAudioAudioDevice::openInput()
 {
-    return initInput();
+    std::lock_guard<std::mutex> lifecycleGuard(mLifecycleLock);
+    return initDevice(ma_device_type_capture);
 }
 
 void MiniAudioAudioDevice::close()
 {
-    if(mDeviceInitialized)
+    std::lock_guard<std::mutex> lifecycleGuard(mLifecycleLock);
+    closeDevice();
+    if (mContextInitialized) {
+        ma_context_uninit(&context);
+        mContextInitialized = false;
+    }
+}
+
+void MiniAudioAudioDevice::closeDevice()
+{
+    if (mDeviceInitialized) {
+        // These calls wait for callbacks. Never hold a source/sink lock here.
+        ma_device_stop(&audioDevice);
         ma_device_uninit(&audioDevice);
-    ma_context_uninit(&context);
-    mDeviceInitialized = false;
+        mDeviceInitialized = false;
+    }
+    {
+        std::lock_guard<std::mutex> sourceGuard(mSourcePtrLock);
+        mFrameAdapter.resetPlayback();
+    }
+    {
+        std::lock_guard<std::mutex> sinkGuard(mSinkPtrLock);
+        mFrameAdapter.resetCapture();
+    }
+}
+
+void MiniAudioAudioDevice::setSource(std::shared_ptr<ISampleSource> newSrc)
+{
+    // Match the callback lock so return also fences calls to the old source.
+    // Release the old shared_ptr on this control thread, outside the lock.
+    std::lock_guard<std::mutex> sourceGuard(mSourcePtrLock);
+    mSource.swap(newSrc);
+    mFrameAdapter.resetPlayback();
+}
+
+void MiniAudioAudioDevice::setSink(std::shared_ptr<ISampleSink> newSink)
+{
+    std::lock_guard<std::mutex> sinkGuard(mSinkPtrLock);
+    mSink.swap(newSink);
+    mFrameAdapter.resetCapture();
 }
 
 static std::map<int, ma_device_info> cachedInputDevices;
 std::map<int, ma_device_info> MiniAudioAudioDevice::getCompatibleInputDevices()
 {
+    static std::mutex cacheLock;
+    std::lock_guard<std::mutex> cacheGuard(cacheLock);
     std::map<int, ma_device_info> deviceList;
 
     ma_device_info* devices;
     ma_uint32 deviceCount;
-    ma_context maContext;
+    ma_context maContext{};
 
     ma_result result = ma_context_init(NULL, 0, NULL, &maContext);
     if(result == MA_SUCCESS) {
@@ -130,12 +181,11 @@ std::map<int, ma_device_info> MiniAudioAudioDevice::getCompatibleInputDevices()
         else {
             LOG("MiniAudioAudioDevice", "Error querying input devices: %s", ma_result_description(result));
         }
+        ma_context_uninit(&maContext);
     }
     else {
         LOG("MiniAudioAudioDevice", "Error initializing input device context: %s", ma_result_description(result));
     }
-
-    ma_context_uninit(&maContext);
 
     return deviceList;
 }
@@ -143,11 +193,13 @@ std::map<int, ma_device_info> MiniAudioAudioDevice::getCompatibleInputDevices()
 static std::map<int, ma_device_info> cachedOutputDevices;
 std::map<int, ma_device_info> MiniAudioAudioDevice::getCompatibleOutputDevices()
 {
+    static std::mutex cacheLock;
+    std::lock_guard<std::mutex> cacheGuard(cacheLock);
     std::map<int, ma_device_info> deviceList;
 
     ma_device_info* devices;
     ma_uint32 deviceCount;
-    ma_context maContext;
+    ma_context maContext{};
 
     ma_result result = ma_context_init(NULL, 0, NULL, &maContext);
     if(result == MA_SUCCESS) {
@@ -207,101 +259,71 @@ std::map<int, ma_device_info> MiniAudioAudioDevice::getCompatibleOutputDevices()
         else {
             LOG("MiniAudioAudioDevice", "Error querying output devices: %s", ma_result_description(result));
         }
+        ma_context_uninit(&maContext);
     }
     else {
         LOG("MiniAudioAudioDevice", "Error initializing output device context: %s", ma_result_description(result));
     }
 
-    ma_context_uninit(&maContext);
-
     return deviceList;
 }
 
-bool MiniAudioAudioDevice::initOutput()
+bool MiniAudioAudioDevice::initDevice(ma_device_type type)
 {
-    if(mDeviceInitialized)
-        ma_device_uninit(&audioDevice);
+    if (mDeviceInitialized && audioDevice.type == type)
+        return true;
+
+    closeDevice();
 
     if(mDeviceName.empty()) {
-        LOG("MiniAudioAudioDevice::initOutput()", "Device name is empty");
+        LOG("MiniAudioAudioDevice", "Device name is empty");
         return false; // bail early if the device name is empty
     }
 
+    if (!initContext())
+        return false;
+
     ma_device_id deviceId;
-    if(!getDeviceForName(mDeviceName, false, deviceId)) {
-        LOG("MiniAudioAudioDevice::initOutput()", "No device found for %s", mDeviceName.c_str());
+    const bool forInput = type == ma_device_type_capture;
+    if(!getDeviceForName(mDeviceName, forInput, deviceId)) {
+        LOG("MiniAudioAudioDevice", "No device found for %s", mDeviceName.c_str());
         return false; // no device found
     }
 
-    ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
-    cfg.playback.pDeviceID = &deviceId;
-    cfg.playback.format = ma_format_f32;
-    cfg.playback.channels = mSplitChannels ? 2 : 1;
-    cfg.playback.shareMode = ma_share_mode_shared;
+    ma_device_config cfg = ma_device_config_init(type);
+    if (forInput) {
+        cfg.capture.pDeviceID = &deviceId;
+        cfg.capture.format = ma_format_f32;
+        cfg.capture.channels = 1;
+        cfg.capture.shareMode = ma_share_mode_shared;
+    } else {
+        cfg.playback.pDeviceID = &deviceId;
+        cfg.playback.format = ma_format_f32;
+        cfg.playback.channels = mSplitChannels ? 2 : 1;
+        cfg.playback.shareMode = ma_share_mode_shared;
+    }
     cfg.sampleRate = sampleRateHz;
     cfg.periodSizeInFrames = frameSizeSamples;
     cfg.pUserData = this;
-    cfg.dataCallback = maOutputCallback;
+    cfg.dataCallback = forInput ? maInputCallback : maOutputCallback;
 
     ma_result result;
 
     result = ma_device_init(&context, &cfg, &audioDevice);
     if(result != MA_SUCCESS) {
-        LOG("MiniAudioAudioDevice", "Error initializing output device: %s", ma_result_description(result));
+        LOG("MiniAudioAudioDevice", "Error initializing device: %s", ma_result_description(result));
         return false;
     }
+    // Own the initialized device even if start fails; closeDevice must uninit it.
+    mDeviceInitialized = true;
 
     result = ma_device_start(&audioDevice);
     if(result != MA_SUCCESS) {
-        LOG("MiniAudioAudioDevice", "Error starting output device: %s", ma_result_description(result));
+        LOG("MiniAudioAudioDevice", "Error starting device: %s", ma_result_description(result));
+        closeDevice();
         return false;
     }
 
-    mDeviceInitialized = true;
-    return true;
-}
-
-bool MiniAudioAudioDevice::initInput()
-{
-    if(mDeviceInitialized)
-        ma_device_uninit(&audioDevice);
-
-    if(mDeviceName.empty()) {
-        LOG("MiniAudioAudioDevice::initInput()", "Device name is empty");
-        return false; // bail early if the device name is empty
-    }
-
-    ma_device_id deviceId;
-    if(!getDeviceForName(mDeviceName, true, deviceId)) {
-        LOG("MiniAudioAudioDevice::initInput()", "No device found for %s", mDeviceName.c_str());
-        return false; // no device found
-    }
-
-    ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
-    cfg.capture.pDeviceID = &deviceId;
-    cfg.capture.format = ma_format_f32;
-    cfg.capture.channels = 1;
-    cfg.capture.shareMode = ma_share_mode_shared;
-    cfg.sampleRate = sampleRateHz;
-    cfg.periodSizeInFrames = frameSizeSamples;
-    cfg.pUserData = this;
-    cfg.dataCallback = maInputCallback;
-
-    ma_result result;
-
-    result = ma_device_init(&context, &cfg, &audioDevice);
-    if(result != MA_SUCCESS) {
-        LOG("MiniAudioAudioDevice", "Error initializing input device: %s", ma_result_description(result));
-        return false;
-    }
-
-    result = ma_device_start(&audioDevice);
-    if(result != MA_SUCCESS) {
-        LOG("MiniAudioAudioDevice", "Error starting input device: %s", ma_result_description(result));
-        return false;
-    }
-
-    mDeviceInitialized = true;
     return true;
 }
 
@@ -323,35 +345,17 @@ bool MiniAudioAudioDevice::getDeviceForName(const std::string &deviceName, bool 
 
 int MiniAudioAudioDevice::outputCallback(void *outputBuffer, unsigned int nFrames)
 {
-    if (outputBuffer) {
-        std::lock_guard<std::mutex> sourceGuard(mSourcePtrLock);
-        for (size_t i = 0; i < nFrames; i += frameSizeSamples) {
-            if (mSource) {
-                SourceStatus rv;
-                rv = mSource->getAudioFrame(reinterpret_cast<float *>(outputBuffer) + i);
-                if (rv != SourceStatus::OK) {
-                    ::memset(reinterpret_cast<float *>(outputBuffer) + i, 0, frameSizeBytes);
-                    mSource.reset();
-                }
-            } else {
-                // if there's no source, but there is an output buffer, zero it to avoid making horrible buzzing sounds.
-                ::memset(reinterpret_cast<float *>(outputBuffer) + i, 0, frameSizeBytes);
-            }
-        }
-    }
-
+    std::lock_guard<std::mutex> sourceGuard(mSourcePtrLock);
+    mFrameAdapter.playback(static_cast<float*>(outputBuffer), nFrames,
+                           audioDevice.playback.channels, mSource.get());
     return 0;
 }
 
 int MiniAudioAudioDevice::inputCallback(const void *inputBuffer, unsigned int nFrames)
 {
     std::lock_guard<std::mutex> sinkGuard(mSinkPtrLock);
-    if (mSink && inputBuffer) {
-        for (size_t i = 0; i < nFrames; i += frameSizeSamples) {
-            mSink->putAudioFrame(reinterpret_cast<const float *>(inputBuffer) + i);
-        }
-    }
-
+    mFrameAdapter.capture(static_cast<const float*>(inputBuffer), nFrames,
+                          audioDevice.capture.channels, mSink.get());
     return 0;
 }
 

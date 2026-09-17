@@ -84,6 +84,10 @@ namespace afv_native {
                 const std::string &clientName = "AFV-Native",
                 std::string baseUrl = "https://voice1.vatsim.net");
 
+        /** The owner must stop/join its event loop and other Client callers
+         * before destruction. Audio devices are closed synchronously before
+         * callback targets are released; evBase must remain alive until return.
+         */
         virtual ~Client();
 
         /** setBaseUrl is used to change the API URL.
@@ -220,6 +224,9 @@ namespace afv_native {
         std::vector<afv::dto::Station> getStationAliases() const;
 
         void startAudio();
+        /** Closes every device and waits for its audio callbacks to finish.
+         * Invoke from the owning/control thread, never an audio callback.
+         */
         void stopAudio();
 
         void startMicrophone();

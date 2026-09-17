@@ -35,6 +35,9 @@
 #define AFV_NATIVE_RADIOSIMULATION_H
 
 #include <memory>
+#include <array>
+#include <atomic>
+#include "afv-native/afv/ReceiveGain.h"
 #include <unordered_map>
 
 #include "afv-native/utility.h"
@@ -75,6 +78,8 @@ namespace afv_native {
             audio::SampleType *mLeftMixingBuffer;
             audio::SampleType *mRightMixingBuffer;
             audio::SampleType *mFetchBuffer;
+            detail::OutputGain outputGain[2];
+            unsigned activeStreams[2] = {0, 0};
             OutputDeviceState();
             virtual ~OutputDeviceState();
         };
@@ -100,7 +105,6 @@ namespace afv_native {
             bool mHfSquelch = false;
             bool mIsReceiving = false;
             bool onHeadset = true;
-            float CurrentAutoGain = 1.0f;
         };
 
         /** CallsignMeta is the per-packetstream metadata stored within the RadioSimulation object.
@@ -111,6 +115,9 @@ namespace afv_native {
         struct CallsignMeta {
             std::shared_ptr<RemoteVoiceSource> source;
             std::vector<dto::RxTransceiver> transceivers;
+            std::array<audio::SampleType, audio::frameSizeSamples> samples{};
+            detail::ReceiveGain receiveGain;
+            bool cached = false;
             CallsignMeta();
         };
 
@@ -214,7 +221,7 @@ namespace afv_native {
 
             std::mutex mRadioStateLock;
             std::atomic<bool> mPtt;
-            bool mLastFramePtt;
+            std::atomic<bool> mLastFramePtt;
             unsigned int mTxRadio;
             std::atomic<uint32_t> mTxSequence;
             std::vector<RadioState> mRadioState;
@@ -227,11 +234,14 @@ namespace afv_native {
             std::shared_ptr<OutputDeviceState> mHeadsetState;
             std::shared_ptr<OutputDeviceState> mSpeakerState;
 
-            float mMicVolume = 1.0f;
-            bool mAutoOutputGain = true;
+            std::atomic<float> mMicVolume{1.0f};
+            bool mAutoOutputGain = false; // opt in; protected by mRadioStateLock
             float mAutoOutputGainStrength = 0.6f;
+            mutable std::mutex mInputLock;
+            std::atomic<double> mPublishedVu{0.0};
+            std::atomic<double> mPublishedPeak{0.0};
 
-            unsigned int mLastReceivedRadio;
+            unsigned int mLastReceivedRadio = 0;
 
             std::shared_ptr<VoiceCompressionSink> mVoiceSink;
             std::shared_ptr<audio::SpeexPreprocessor> mVoiceFilter;
@@ -253,11 +263,10 @@ namespace afv_native {
                     const std::string &dtoName, const unsigned char *bufIn, size_t bufLen);
 
             void maintainIncomingStreams();
-            float getAutoOutputGainMultiplier(int concurrentStreams) const;
-            float smoothAutoOutputGain(float currentGain, float targetGain) const;
+            void resetReceiveGains(); // caller holds radio and stream locks
+            void resetRadioReceiveGains(unsigned radio, unsigned nextFrequency, bool nextOnHeadset);
         private:
             bool _process_radio(
-                    const std::map<void *, audio::SampleType[audio::frameSizeSamples]> &sampleCache,
                     size_t rxIter,
                     bool onHeadset);
 

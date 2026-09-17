@@ -35,6 +35,7 @@
 #define AFV_NATIVE_VOICECOMPRESSIONSINK_H
 
 #include <opus/opus.h>
+#include <mutex>
 #include <vector>
 
 #include "afv-native/audio/ISampleSink.h"
@@ -53,6 +54,10 @@ namespace afv_native {
         protected:
             OpusEncoder *mEncoder;
             ICompressedFrameSink &mCompressedFrameSink;
+        private:
+            std::mutex mEncoderMutex;
+            int openLocked();
+            void closeLocked();
         public:
             VoiceCompressionSink(ICompressedFrameSink &sink);
             virtual ~VoiceCompressionSink();

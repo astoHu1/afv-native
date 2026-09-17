@@ -59,7 +59,7 @@ Client::Client(
         mClientLongitude(0.0),
         mClientAltitudeMSLM(0.0),
         mClientAltitudeGLM(0.0),
-        mRadioState(2),
+        mRadioState(numRadios),
         mCallsign(),
         mTxUpdatePending(false),
         mWantPtt(false),
@@ -86,6 +86,11 @@ Client::Client(
 
 Client::~Client()
 {
+    // The owner must stop the event loop before destruction. Drain audio
+    // callbacks while their radio simulation and client callbacks still exist.
+    stopTransceiverUpdate();
+    stopAudio();
+
     mVoiceSession.StateCallback.removeCallback(this);
     mAPISession.StateCallback.removeCallback(this);
     mAPISession.AliasUpdateCallback.removeCallback(this);
@@ -106,7 +111,7 @@ void Client::setClientPosition(double lat, double lon, double amslm, double aglm
 
 void Client::setRadioState(unsigned int radioNum, int freq)
 {
-    if (radioNum > mRadioState.size()) {
+    if (radioNum >= mRadioState.size()) {
         return;
     }
     if (mRadioState[radioNum].mNextFreq == freq) {
@@ -123,6 +128,9 @@ void Client::setRadioState(unsigned int radioNum, int freq)
 
 void Client::setTxRadio(unsigned int radioNum)
 {
+    if (radioNum >= mRadioState.size()) {
+        return;
+    }
     mRadioSim->setTxRadio(radioNum);
 }
 
@@ -298,6 +306,8 @@ void Client::startMicrophone()
     }
 
     if(!mMicrophoneDevice->openInput()) {
+        mMicrophoneDevice->close();
+        mMicrophoneDevice.reset();
         const char* error = "Audio Error: Could not open microphone device. Please check the xPilot audio settings and try again.";
         ClientEventCallback.invokeAll(ClientEventType::AudioError, reinterpret_cast<void*>(const_cast<char*>(error)), nullptr);
         LOG("afv::Client", error);
@@ -331,6 +341,8 @@ void Client::startHeadset()
     }
 
     if(!mHeadsetDevice->openOutput()) {
+        mHeadsetDevice->close();
+        mHeadsetDevice.reset();
         const char* error = "Audio Error: Could not open headset device. Please check the xPilot audio settings and try again.";
         ClientEventCallback.invokeAll(ClientEventType::AudioError, reinterpret_cast<void*>(const_cast<char*>(error)), nullptr);
         LOG("afv::Client", error);
@@ -364,6 +376,8 @@ void Client::startSpeaker()
     }
 
     if(!mSpeakerDevice->openOutput()) {
+        mSpeakerDevice->close();
+        mSpeakerDevice.reset();
         const char* error = "Audio Error: Could not open speaker device. Please check the xPilot audio settings and try again.";
         ClientEventCallback.invokeAll(ClientEventType::AudioError, reinterpret_cast<void*>(const_cast<char*>(error)), nullptr);
         LOG("afv::Client", error);
@@ -521,6 +535,9 @@ void Client::setAudioApi(audio::AudioDevice::Api api)
 
 void Client::setRadioGain(unsigned int radioNum, float gain)
 {
+    if (radioNum >= mRadioState.size()) {
+        return;
+    }
     mRadioSim->setGain(radioNum, gain);
 }
 
@@ -580,13 +597,33 @@ void Client::setAutoOutputGainStrength(float strength)
 
 void Client::setOnHeadset(unsigned int radio, bool onHeadset)
 {
+    if (radio >= mRadioState.size()) {
+        return;
+    }
     mRadioSim->setOnHeadset(radio, onHeadset);
 }
 
 void Client::setSplitAudioChannels(bool split)
 {
+    if (mSplitAudioChannels == split) {
+        return;
+    }
+    const bool restartMicrophone = static_cast<bool>(mMicrophoneDevice);
+    const bool restartHeadset = static_cast<bool>(mHeadsetDevice);
+    const bool restartSpeaker = static_cast<bool>(mSpeakerDevice);
+    // Device buffers use the old width until close() has drained callbacks.
+    stopAudio();
     mSplitAudioChannels = split;
     mRadioSim->setSplitAudioChannels(split);
+    if (restartMicrophone) {
+        startMicrophone();
+    }
+    if (restartHeadset) {
+        startHeadset();
+    }
+    if (restartSpeaker) {
+        startSpeaker();
+    }
 }
 
 void Client::aliasUpdateCallback()
@@ -616,14 +653,14 @@ std::shared_ptr<const audio::AudioDevice> Client::getSpeakerDevice() const {
 }
 
 bool Client::getRxActive(unsigned int radioNumber) {
-    if (mRadioSim) {
+    if (mRadioSim && radioNumber < mRadioState.size()) {
         return mRadioSim->getRxActive(radioNumber);
     }
     return false;
 }
 
 bool Client::getTxActive(unsigned int radioNumber) {
-    if (mRadioSim) {
+    if (mRadioSim && radioNumber < mRadioState.size()) {
         return mRadioSim->getTxActive(radioNumber);
     }
     return false;

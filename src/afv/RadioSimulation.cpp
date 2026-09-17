@@ -35,6 +35,7 @@
 #include <cmath>
 #include <atomic>
 #include <iostream>
+#include <algorithm>
 
 #include "afv-native/Log.h"
 #include "afv-native/afv/RadioSimulation.h"
@@ -70,7 +71,8 @@ OutputAudioDevice::OutputAudioDevice(std::weak_ptr<RadioSimulation> radio, bool 
 
 audio::SourceStatus OutputAudioDevice::getAudioFrame(audio::SampleType *bufferOut)
 {
-    return mRadio.lock()->getAudioFrame(bufferOut, onHeadset);
+    if (auto radio = mRadio.lock()) return radio->getAudioFrame(bufferOut, onHeadset);
+    return audio::SourceStatus::Closed;
 }
 
 OutputDeviceState::OutputDeviceState()
@@ -120,17 +122,23 @@ RadioSimulation::RadioSimulation(
 
 RadioSimulation::~RadioSimulation()
 {
-
+    mMaintenanceTimer.disable();
+    setUDPChannel(nullptr);
 }
 
 void RadioSimulation::putAudioFrame(const audio::SampleType *bufferIn)
 {
     audio::SampleType samples[audio::frameSizeSamples];
-    mVoiceFilter->transformFrame(samples, bufferIn);
+    // Only the capture callback updates the filter and rolling meter.
+    std::lock_guard<std::mutex> inputGuard(mInputLock);
+    for (int i = 0; i < audio::frameSizeSamples; ++i)
+        samples[i] = std::isfinite(bufferIn[i]) ? std::clamp(bufferIn[i], -1.0f, 1.0f) : 0.0f;
+    if (mVoiceFilter) mVoiceFilter->transformFrame(samples, samples);
+    const float micVolume = mMicVolume.load(std::memory_order_relaxed);
 
     float value = 0;
     for(int i = 0; i < audio::frameSizeSamples; i++) {
-        value = samples[i] * mMicVolume;
+        value = samples[i] * micVolume;
         if(value > 1.0f) {
             value = 1.0f;
         }
@@ -157,6 +165,12 @@ void RadioSimulation::putAudioFrame(const audio::SampleType *bufferIn)
         if(ratio > 1.0)
             ratio = 1;
         mVuMeter.addDatum(ratio);
+        const double meterPeak = std::clamp(mVuMeter.getMax(), 0.0, 1.0);
+        // Incremental averaging can drift a few ulps outside [0, 1]. Publish
+        // normalized meter values, and make a fully silent window exactly zero.
+        mPublishedVu.store(meterPeak == 0 ? 0 : std::clamp(mVuMeter.getAverage(), 0.0, 1.0),
+                           std::memory_order_relaxed);
+        mPublishedPeak.store(meterPeak, std::memory_order_relaxed);
     }
 
     if (!mPtt.load() && !mLastFramePtt) {
@@ -170,11 +184,10 @@ void RadioSimulation::putAudioFrame(const audio::SampleType *bufferIn)
 
 void RadioSimulation::processCompressedFrame(std::vector<unsigned char> compressedData)
 {
+    std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
     if (mChannel != nullptr && mChannel->isOpen()) {
         dto::AudioTxOnTransceivers audioOutDto;
         {
-            std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
-
             if (!mPtt.load()) {
                 audioOutDto.LastPacket = true;
                 mLastFramePtt = false;
@@ -202,7 +215,8 @@ RadioSimulation::mix_buffers(audio::SampleType* RESTRICT src_dst, const audio::S
 }
 
 bool RadioSimulation::getTxActive(unsigned int radio) {
-    if (radio != mTxRadio) {
+    std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
+    if (radio >= mRadioState.size() || radio != mTxRadio) {
         return false;
     }
     return mPtt.load();
@@ -213,7 +227,7 @@ RadioSimulation::getRxActive(unsigned int radio)
 {
     std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
 
-    return (mRadioState[radio].mLastRxCount > 0);
+    return radio < mRadioState.size() && mRadioState[radio].mLastRxCount > 0;
 }
 
 inline bool
@@ -223,7 +237,6 @@ freqIsHF(unsigned int freq)
 }
 
 bool RadioSimulation::_process_radio(
-    const std::map<void *, audio::SampleType[audio::frameSizeSamples]> &sampleCache,
     size_t rxIter,
     bool onHeadset)
 {
@@ -243,7 +256,7 @@ bool RadioSimulation::_process_radio(
     float acBusGain = 0.0f;
     uint32_t concurrentStreams = 0;
     for (auto &srcPair: (onHeadset ? mHeadsetIncomingStreams : mSpeakerIncomingStreams)) {
-        if (!srcPair.second.source || !srcPair.second.source->isActive() || (sampleCache.find(srcPair.second.source.get()) == sampleCache.end())) {
+        if (!srcPair.second.cached) {
             continue;
         }
         for (const afv::dto::RxTransceiver &tx: srcPair.second.transceivers) {
@@ -254,11 +267,12 @@ bool RadioSimulation::_process_radio(
         }
     }
 
-    const float targetAutoGain = getAutoOutputGainMultiplier(static_cast<int>(concurrentStreams));
-    mRadioState[rxIter].CurrentAutoGain = smoothAutoOutputGain(mRadioState[rxIter].CurrentAutoGain, targetAutoGain);
+    const unsigned outputChannel = mSplitChannels && rxIter == 1 ? 1 : 0;
+    if (mRadioState[rxIter].Gain > 0)
+        state->activeStreams[outputChannel] += concurrentStreams;
 
     for (auto &srcPair: (onHeadset ? mHeadsetIncomingStreams : mSpeakerIncomingStreams)) {
-        if (!srcPair.second.source || !srcPair.second.source->isActive() || (sampleCache.find(srcPair.second.source.get()) == sampleCache.end())) {
+        if (!srcPair.second.cached) {
             continue;
         }
         bool mUseStream = false;
@@ -300,15 +314,8 @@ bool RadioSimulation::_process_radio(
             }
         }
         if (mUseStream) {
-            // then include this stream.
-            try {
-                mix_buffers(
-                            state->mChannelBuffer,
-                            sampleCache.at(srcPair.second.source.get()),
-                            voiceGain * mRadioState[rxIter].Gain * mRadioState[rxIter].CurrentAutoGain);
-            } catch (const std::out_of_range &) {
-                LOG("RadioSimulation", "internal error:  Tried to mix uncached stream");
-            }
+            mix_buffers(state->mChannelBuffer, srcPair.second.samples.data(),
+                        voiceGain * mRadioState[rxIter].Gain);
         }
     }
 
@@ -387,18 +394,21 @@ bool RadioSimulation::_process_radio(
 
 audio::SourceStatus RadioSimulation::getAudioFrame(audio::SampleType *bufferOut, bool onHeadset)
 {
-    std::shared_ptr<OutputDeviceState> state = onHeadset ? mHeadsetState : mSpeakerState;
-
     std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
     std::lock_guard<std::mutex> streamGuard(mStreamMapLock);
-
-    std::map<void *, audio::SampleType[audio::frameSizeSamples]> sampleCache;
-    for (auto &src: (onHeadset ? mHeadsetIncomingStreams : mSpeakerIncomingStreams)) {
-        if (src.second.source && src.second.source->isActive() && (sampleCache.find(src.second.source.get()) == sampleCache.end())) {
-            const auto rv = src.second.source->getAudioFrame(sampleCache[src.second.source.get()]);
-            if (rv != audio::SourceStatus::OK) {
-                sampleCache.erase(src.second.source.get());
-            }
+    auto state = onHeadset ? mHeadsetState : mSpeakerState;
+    if (!state) return audio::SourceStatus::Closed;
+    state->activeStreams[0] = state->activeStreams[1] = 0;
+    // Cache lives with each stream: decoding and DSP add no per-frame map allocation.
+    for (auto &src : (onHeadset ? mHeadsetIncomingStreams : mSpeakerIncomingStreams)) {
+        auto &stream = src.second;
+        stream.cached = stream.source && stream.source->isActive() &&
+            stream.source->getAudioFrame(stream.samples.data()) == audio::SourceStatus::OK;
+        if (stream.cached) {
+            stream.receiveGain.process(stream.samples.data(), audio::frameSizeSamples,
+                                       mAutoOutputGain, mAutoOutputGainStrength);
+        } else {
+            stream.receiveGain.reset();
         }
     }
 
@@ -409,16 +419,20 @@ audio::SourceStatus RadioSimulation::getAudioFrame(audio::SampleType *bufferOut,
     size_t rxIter = 0;
     for (rxIter = 0; rxIter < mRadioState.size(); rxIter++) {
         if(mRadioState[rxIter].onHeadset == onHeadset) {
-            _process_radio(sampleCache, rxIter, onHeadset);
+            _process_radio(rxIter, onHeadset);
         }
     }
 
     if(mSplitChannels) {
-        audio::SampleType interleavedSamples[audio::frameSizeSamples * 2];
-        interleave(state->mLeftMixingBuffer, state->mRightMixingBuffer, interleavedSamples, audio::frameSizeSamples);
-        ::memcpy(bufferOut, interleavedSamples, sizeof(audio::SampleType) * audio::frameSizeSamples * 2);
+        state->outputGain[0].process(state->mLeftMixingBuffer, audio::frameSizeSamples,
+            state->activeStreams[0], mAutoOutputGain, mAutoOutputGainStrength);
+        state->outputGain[1].process(state->mRightMixingBuffer, audio::frameSizeSamples,
+            state->activeStreams[1], mAutoOutputGain, mAutoOutputGainStrength);
+        interleave(state->mLeftMixingBuffer, state->mRightMixingBuffer, bufferOut, audio::frameSizeSamples);
     }
     else {
+        state->outputGain[0].process(state->mMixingBuffer, audio::frameSizeSamples,
+            state->activeStreams[0], mAutoOutputGain, mAutoOutputGainStrength);
         ::memcpy(bufferOut, state->mMixingBuffer, sizeof(audio::SampleType) * audio::frameSizeSamples);
     }
 
@@ -477,6 +491,8 @@ void RadioSimulation::setFrequency(unsigned int radio, unsigned int frequency)
     if (mRadioState[radio].Frequency == frequency) {
         return;
     }
+    std::lock_guard<std::mutex> streamGuard(mStreamMapLock);
+    resetRadioReceiveGains(radio, frequency, mRadioState[radio].onHeadset);
     mRadioState[radio].Frequency = frequency;
     // reset all of the effects, except the click which should be audiable due to the Squelch-gate kicking in on the new frequency
     resetRadioFx(radio, true);
@@ -504,7 +520,8 @@ void RadioSimulation::setPtt(bool pressed)
 void RadioSimulation::setGain(unsigned int radio, float gain)
 {
     std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
-    mRadioState[radio].Gain = gain;
+    if (radio >= mRadioState.size() || !std::isfinite(gain)) return;
+    mRadioState[radio].Gain = std::max(0.0f, gain);
     LOG("RadioSimulation", "setGain: %i: %f", radio, gain);
 }
 
@@ -520,37 +537,58 @@ void RadioSimulation::setTxRadio(unsigned int radio)
 
 void RadioSimulation::setMicrophoneVolume(float volume)
 {
-    mMicVolume = volume;
+    mMicVolume.store(std::isfinite(volume) ? std::max(0.0f, volume) : 1.0f);
 }
 
 void RadioSimulation::setAutoOutputGain(bool enableAutoOutputGain)
 {
+    std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
+    if (mAutoOutputGain == enableAutoOutputGain) return;
+    std::lock_guard<std::mutex> streamGuard(mStreamMapLock);
     mAutoOutputGain = enableAutoOutputGain;
+    resetReceiveGains();
 }
 
 void RadioSimulation::setAutoOutputGainStrength(float strength)
 {
-    mAutoOutputGainStrength = fmax(0.0f, fmin(1.0f, strength));
+    std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
+    mAutoOutputGainStrength = std::isfinite(strength) ? std::clamp(strength, 0.0f, 1.0f) : 0.0f;
 }
 
-float RadioSimulation::getAutoOutputGainMultiplier(int concurrentStreams) const
+void RadioSimulation::resetReceiveGains()
 {
-    if (!mAutoOutputGain || concurrentStreams <= 1) {
-        return 1.0f;
+    for (auto &entry : mHeadsetIncomingStreams) entry.second.receiveGain.reset();
+    for (auto &entry : mSpeakerIncomingStreams) entry.second.receiveGain.reset();
+    for (auto &state : {mHeadsetState, mSpeakerState}) {
+        if (state) for (auto &gain : state->outputGain) gain.reset();
     }
-
-    const float scaledStreams = static_cast<float>(concurrentStreams - 1);
-    const float attenuation = 0.22f * mAutoOutputGainStrength * scaledStreams;
-    const float floor = 1.0f - (0.55f * mAutoOutputGainStrength);
-    return fmax(floor, 1.0f - attenuation);
 }
 
-float RadioSimulation::smoothAutoOutputGain(float currentGain, float targetGain) const
+void RadioSimulation::resetRadioReceiveGains(unsigned radio, unsigned nextFrequency, bool nextOnHeadset)
 {
-    const float attack = 0.35f;
-    const float release = 0.12f;
-    const float factor = targetGain < currentGain ? attack : release;
-    return currentGain + ((targetGain - currentGain) * factor);
+    const auto &previous = mRadioState[radio];
+    for (bool headset : {true, false}) {
+        auto state = headset ? mHeadsetState : mSpeakerState;
+        bool affected = headset == previous.onHeadset && previous.mLastRxCount > 0;
+        for (auto &entry : (headset ? mHeadsetIncomingStreams : mSpeakerIncomingStreams)) {
+            auto &stream = entry.second;
+            bool matches = false, usedElsewhere = false;
+            for (const auto &tx : stream.transceivers) {
+                matches |= (headset == previous.onHeadset && tx.Frequency == previous.Frequency) ||
+                           (headset == nextOnHeadset && tx.Frequency == nextFrequency);
+                for (unsigned other = 0; other < mRadioState.size(); ++other) {
+                    const auto &receiver = mRadioState[other];
+                    usedElsewhere |= other != radio && receiver.onHeadset == headset &&
+                                     receiver.Frequency == tx.Frequency && receiver.Gain > 0;
+                }
+            }
+            if (matches) {
+                if (!usedElsewhere) stream.receiveGain.reset();
+                affected |= stream.cached;
+            }
+        }
+        if (affected && state) state->outputGain[mSplitChannels && radio == 1 ? 1 : 0].reset();
+    }
 }
 
 void RadioSimulation::dtoHandler(const std::string &dtoName, const unsigned char *bufIn, size_t bufLen, void *user_data)
@@ -576,6 +614,7 @@ void RadioSimulation::instDtoHandler(const std::string &dtoName, const unsigned 
 
 void RadioSimulation::setUDPChannel(cryptodto::UDPChannel *newChannel)
 {
+    std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
     if (mChannel != nullptr) {
         mChannel->unregisterDtoHandler("AR");
     }
@@ -623,13 +662,17 @@ void RadioSimulation::maintainIncomingStreams()
 
 void RadioSimulation::setCallsign(const std::string &newCallsign)
 {
+    std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
     mCallsign = newCallsign;
 }
 
 void RadioSimulation::reset()
 {
     {
+        std::lock_guard<std::mutex> radioStateGuard(mRadioStateLock);
         std::lock_guard<std::mutex> ml(mStreamMapLock);
+        resetReceiveGains();
+        for (unsigned i = 0; i < mRadioState.size(); ++i) resetRadioFx(i);
         mHeadsetIncomingStreams.clear();
         mSpeakerIncomingStreams.clear();
     }
@@ -642,21 +685,23 @@ void RadioSimulation::reset()
 
 double RadioSimulation::getVu() const
 {
-    return std::max(-40.0, mVuMeter.getAverage());
+    return mPublishedVu.load(std::memory_order_relaxed);
 }
 
 double RadioSimulation::getPeak() const
 {
-    return std::max(-40.0, mVuMeter.getMax());
+    return mPublishedPeak.load(std::memory_order_relaxed);
 }
 
 bool RadioSimulation::getEnableInputFilters() const
 {
+    std::lock_guard<std::mutex> inputGuard(mInputLock);
     return static_cast<bool>(mVoiceFilter);
 }
 
 void RadioSimulation::setEnableInputFilters(bool enableInputFilters)
 {
+    std::lock_guard<std::mutex> inputGuard(mInputLock);
     if (enableInputFilters) {
         if (!mVoiceFilter) {
             mVoiceFilter = std::make_shared<audio::SpeexPreprocessor>(mVoiceSink);
@@ -696,11 +741,18 @@ void RadioSimulation::setupDevices(util::ChainedCallback<void (ClientEventType, 
 void RadioSimulation::setOnHeadset(unsigned int radio, bool onHeadset)
 {
     std::lock_guard<std::mutex> mRadioStateGuard(mRadioStateLock);
+    if (radio >= mRadioState.size() || mRadioState[radio].onHeadset == onHeadset) return;
+    std::lock_guard<std::mutex> streamGuard(mStreamMapLock);
+    resetRadioReceiveGains(radio, mRadioState[radio].Frequency, onHeadset);
+    resetRadioFx(radio);
     mRadioState[radio].onHeadset = onHeadset;
 }
 
 void RadioSimulation::setSplitAudioChannels(bool splitChannels)
 {
     std::lock_guard<std::mutex> mRadioStateGuard(mRadioStateLock);
+    if (mSplitChannels == splitChannels) return;
+    std::lock_guard<std::mutex> streamGuard(mStreamMapLock);
+    resetReceiveGains();
     mSplitChannels = splitChannels;
 }

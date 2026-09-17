@@ -65,15 +65,18 @@ namespace afv_native {
             JitterBuffer *mJitterBuffer;
             OpusDecoder *mDecoder;
 
-            std::mutex mJitterBufferMutex;
+            // Protects the entire stream, including the Opus decoder and metadata.
+            mutable std::mutex mJitterBufferMutex;
             bool mIsActive;
             util::monotime_t mLastActive;
         protected:
             int mSilentFrames;
 
-            int mCurrentFrame;
+            uint32_t mCurrentFrame;
             bool mEnding;
-            int mEndingSequence;
+            uint32_t mEndingSequence;
+        private:
+            void flushLocked();
         public:
             RemoteVoiceSource();
             virtual ~RemoteVoiceSource();

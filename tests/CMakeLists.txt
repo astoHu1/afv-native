@@ -1,0 +1,82 @@
+cmake_minimum_required(VERSION 3.25)
+project(afv_offline_tests LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+enable_testing()
+
+set(AFV_SANITIZER "" CACHE STRING "address or thread; empty for an ordinary build")
+if(AFV_SANITIZER AND NOT MSVC)
+    if(AFV_SANITIZER STREQUAL "address")
+        set(SANITIZERS address,undefined)
+    elseif(AFV_SANITIZER STREQUAL "thread")
+        set(SANITIZERS thread)
+    else()
+        message(FATAL_ERROR "Unknown AFV_SANITIZER")
+    endif()
+    add_compile_options(-fsanitize=${SANITIZERS} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${SANITIZERS})
+endif()
+
+get_filename_component(AFV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+get_filename_component(REPO_ROOT "${AFV_ROOT}/../.." ABSOLUTE)
+set(AFV_DEPENDENCIES "${REPO_ROOT}/dependencies" CACHE PATH "xPilot vendored dependencies")
+if(WIN32)
+    set(AFV_PLATFORM windows)
+elseif(APPLE)
+    set(AFV_PLATFORM macos)
+else()
+    set(AFV_PLATFORM linux)
+endif()
+set(AFV_LIBS "${AFV_DEPENDENCIES}/platform/${AFV_PLATFORM}")
+
+# Compile the production native library. Only resource loading is replaced:
+# tests supply in-memory effects and never create a GUI, device or connection.
+file(GLOB_RECURSE NATIVE_SOURCES CONFIGURE_DEPENDS "${AFV_ROOT}/src/*.cpp")
+list(FILTER NATIVE_SOURCES EXCLUDE REGEX "/(WavFile|EffectResources)\\.cpp$")
+file(GLOB COMPRESSOR_SOURCES "${AFV_ROOT}/extern/compressor/*.c")
+add_library(afv_test_native STATIC ${NATIVE_SOURCES} ${COMPRESSOR_SOURCES} test_resources.cpp)
+target_include_directories(afv_test_native PUBLIC
+    "${AFV_ROOT}/.."
+    "${AFV_ROOT}/include" "${AFV_ROOT}/src" "${AFV_ROOT}/extern"
+    "${AFV_ROOT}/extern/cpp-jwt/include" "${AFV_ROOT}/extern/simpleSource"
+    "${AFV_DEPENDENCIES}/opus/include" "${AFV_DEPENDENCIES}/speexdsp/include"
+    "${AFV_DEPENDENCIES}/msgpack-c/include" "${AFV_DEPENDENCIES}/json/include"
+    "${AFV_LIBS}/openssl/include" "${AFV_LIBS}/libevent/include" "${AFV_LIBS}/libcurl/include")
+target_compile_definitions(afv_test_native PUBLIC MSGPACK_NO_BOOST CURL_STATICLIB)
+find_package(Threads REQUIRED)
+target_link_libraries(afv_test_native PUBLIC Threads::Threads)
+foreach(LIB IN ITEMS opus speexdsp event curl ssl crypto)
+    find_library(AFV_${LIB} NAMES ${LIB} PATHS "${AFV_LIBS}" "${AFV_LIBS}/openssl"
+        "${AFV_LIBS}/libevent" "${AFV_LIBS}/libcurl" NO_DEFAULT_PATH REQUIRED)
+    target_link_libraries(afv_test_native PUBLIC ${AFV_${LIB}})
+endforeach()
+# Client lifecycle tests pull in the static curl HTTP objects and their zlib dependency.
+if(WIN32)
+    set(ZLIB_ROOT "${AFV_LIBS}/zlib")
+endif()
+find_package(ZLIB REQUIRED)
+target_link_libraries(afv_test_native PUBLIC "$<LINK_ONLY:ZLIB::ZLIB>")
+if(APPLE)
+    target_link_libraries(afv_test_native PUBLIC "-framework CoreFoundation" "-framework CoreAudio"
+        "-framework AudioToolbox" "-framework Security" "-framework SystemConfiguration")
+elseif(WIN32)
+    target_compile_definitions(afv_test_native PUBLIC _USE_MATH_DEFINES NOMINMAX)
+    target_link_libraries(afv_test_native PUBLIC ws2_32 crypt32 bcrypt iphlpapi)
+else()
+    target_link_libraries(afv_test_native PUBLIC dl m)
+endif()
+
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*_tests.cpp")
+foreach(TEST_SOURCE IN LISTS TEST_SOURCES)
+    get_filename_component(TEST_NAME "${TEST_SOURCE}" NAME_WE)
+    add_executable(${TEST_NAME} "${TEST_SOURCE}")
+    if(TEST_NAME STREQUAL "device_lifecycle_tests")
+        target_sources(${TEST_NAME} PRIVATE "${AFV_ROOT}/src/audio/AudioDevice.cpp")
+        target_include_directories(${TEST_NAME} PRIVATE "${AFV_ROOT}/include")
+        target_link_libraries(${TEST_NAME} PRIVATE Threads::Threads)
+    else()
+        target_link_libraries(${TEST_NAME} PRIVATE afv_test_native)
+    endif()
+    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+    set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT 90)
+endforeach()

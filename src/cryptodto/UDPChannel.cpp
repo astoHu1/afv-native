@@ -84,6 +84,7 @@ void UDPChannel::registerDtoHandler(
     const string& dtoName,
     std::function<void(const unsigned char* data, size_t len)> callback)
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     mDtoHandlers[dtoName] = callback;
 }
 
@@ -95,6 +96,7 @@ void UDPChannel::evReadCallback(evutil_socket_t fd, short events, void* arg)
 
 void UDPChannel::readCallback()
 {
+    std::unique_lock<std::recursive_mutex> lock(mChannelMutex);
     int dgSize = ::recv(
         mUDPSocket, reinterpret_cast<char*>(mDatagramRxBuffer), maxPermittedDatagramSize, 0);
     if (dgSize < 0)
@@ -161,21 +163,20 @@ void UDPChannel::readCallback()
         LOG("udpchannel:readCallback", "no handler for packet-type %s", dtoName.c_str());
         return;
     }
-    else
-    {
-        if (dtoBuf.size() == 2)
-        {
-            dtoIter->second(nullptr, 0);
-        }
-        else
-        {
-            dtoIter->second(reinterpret_cast<const unsigned char*>(dtoBuf.data()) + 2, dtoBuf.size() - 2);
-        }
-    }
+    // A radio handler takes the radio lock; capture takes radio then channel.
+    // Dispatch outside this lock to preserve that ordering.
+    auto handler = dtoIter->second;
+    lock.unlock();
+    handler(dtoBuf.size() == 2 ? nullptr :
+            reinterpret_cast<const unsigned char*>(dtoBuf.data()) + 2, dtoBuf.size() - 2);
 }
 
 bool UDPChannel::open()
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
+    if (mUDPSocket >= 0) {
+        return true;
+    }
     if (mAddress.empty())
     {
         LOG("udpchannel", "tried to open without address set");
@@ -198,7 +199,9 @@ bool UDPChannel::open()
 
         if (saddr.ss_family == AF_INET6)
         {
-            struct sockaddr_in6 baddr = { AF_INET6, 0, 0, IN6ADDR_ANY_INIT, 0, };
+            struct sockaddr_in6 baddr{};
+            baddr.sin6_family = AF_INET6;
+            baddr.sin6_addr = in6addr_any;
             if (::bind(mUDPSocket, reinterpret_cast<struct sockaddr*>(&baddr), sizeof(baddr)))
             {
                 mLastErrno = evutil_socket_geterror(mUDPSocket);
@@ -210,7 +213,9 @@ bool UDPChannel::open()
         else
         {
             // IPV4.
-            struct sockaddr_in baddr = { AF_INET, 0, INADDR_ANY, };
+            struct sockaddr_in baddr{};
+            baddr.sin_family = AF_INET;
+            baddr.sin_addr.s_addr = htonl(INADDR_ANY);
             if (::bind(mUDPSocket, reinterpret_cast<struct sockaddr*>(&baddr), sizeof(baddr)))
             {
                 mLastErrno = evutil_socket_geterror(mUDPSocket);
@@ -229,7 +234,10 @@ bool UDPChannel::open()
 
         // bind up the libevent handling
         mSocketEvent = event_new(mEvBase, mUDPSocket, EV_READ | EV_PERSIST, UDPChannel::evReadCallback, this);
-        event_add(mSocketEvent, nullptr);
+        if (mSocketEvent == nullptr || event_add(mSocketEvent, nullptr) != 0) {
+            close();
+            return false;
+        }
         return true;
     }
     return false;
@@ -237,12 +245,15 @@ bool UDPChannel::open()
 
 void UDPChannel::close()
 {
+    // event_del can wait for a receive callback. Do not hold the channel lock
+    // while waiting for it; it may need that lock to finish.
     if (mSocketEvent != nullptr)
     {
         event_del(mSocketEvent);
         event_free(mSocketEvent);
         mSocketEvent = nullptr;
     }
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     if (mUDPSocket >= 0)
     {
         #ifdef WIN32
@@ -257,16 +268,19 @@ void UDPChannel::close()
 
 void UDPChannel::setAddress(const std::string& address)
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     mAddress = address;
 }
 
 bool UDPChannel::isOpen() const
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     return (mUDPSocket >= 0);
 }
 
 void UDPChannel::enableRxMode(CryptoDtoMode mode)
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     if (mode >= CryptoModeLast)
     {
         return;
@@ -278,6 +292,7 @@ void UDPChannel::enableRxMode(CryptoDtoMode mode)
 
 void UDPChannel::disableRxMode(CryptoDtoMode mode)
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     if (mode >= CryptoModeLast)
     {
         return;
@@ -289,6 +304,7 @@ void UDPChannel::disableRxMode(CryptoDtoMode mode)
 
 bool UDPChannel::RxModeEnabled(CryptoDtoMode mode) const
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     if (mode >= CryptoModeLast)
     {
         return false;
@@ -299,16 +315,19 @@ bool UDPChannel::RxModeEnabled(CryptoDtoMode mode) const
 
 void UDPChannel::unregisterDtoHandler(const std::string& dtoName)
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     mDtoHandlers.erase(dtoName);
 }
 
 int UDPChannel::getLastErrno() const
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     return mLastErrno;
 }
 
 void UDPChannel::setChannelConfig(const dto::ChannelConfig& config)
 {
+    std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
     // if the channel keys change, we need to reset our rx expected sequence as the cipher
     // has probably restarted.  We do not need to reset tx since the other end will deal.
     if (::memcmp(aeadReceiveKey, config.AeadReceiveKey, aeadModeKeySize) != 0)

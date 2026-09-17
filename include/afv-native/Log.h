@@ -49,6 +49,11 @@ namespace afv_native {
     typedef void (*log_fn)(const char *subsystem, const char *file, int line, const char *lineOut, void* ref);
 
     void __Log(const char *file, int line, const char *subsystem, const char *format, ...);
+    /** Replaces the logger and waits for any callback running on another thread.
+     * Passing nullptr disables logging. After clearing from outside a callback,
+     * the previous context can be destroyed. A callback replacing itself must
+     * keep its context alive until that callback returns.
+     */
     void setLogger(afv_native::log_fn newLogger, void* ref);
     void __Dumphex(const char *file, int line, const char *subsystem, const void *buf, size_t len);
 }

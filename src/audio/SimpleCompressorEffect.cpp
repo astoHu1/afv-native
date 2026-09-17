@@ -1,4 +1,5 @@
 #include "afv-native/audio/SimpleCompressorEffect.h"
+#include <array>
 
 using namespace afv_native::audio;
 
@@ -14,21 +15,19 @@ SimpleCompressorEffect::~SimpleCompressorEffect()
 
 void SimpleCompressorEffect::transformFrame(SampleType *bufferOut, const SampleType bufferIn[])
 {
-    sf_snd output_snd = sf_snd_new(frameSizeSamples, sampleRateHz, true);
-    sf_snd input_snd = sf_snd_new(frameSizeSamples, sampleRateHz, true);
+    std::array<sf_sample_st, frameSizeSamples> output{};
+    std::array<sf_sample_st, frameSizeSamples> input{};
 
     for(int i = 0; i < frameSizeSamples; i++)
     {
-        input_snd->samples[i].L = bufferIn[i];
+        input[i].L = bufferIn[i];
     }
 
-    sf_compressor_process(&m_simpleCompressor, frameSizeSamples, input_snd->samples, output_snd->samples);
+    sf_compressor_process(&m_simpleCompressor, frameSizeSamples, input.data(), output.data());
 
     for(int i = 0; i < frameSizeSamples; i++)
     {
-        bufferOut[i] = static_cast<SampleType>(output_snd->samples[i].L);
+        bufferOut[i] = static_cast<SampleType>(output[i].L);
     }
 
-    sf_snd_free(input_snd);
-    sf_snd_free(output_snd);
 }

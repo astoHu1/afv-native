@@ -34,6 +34,7 @@
 #include "afv-native/afv/VoiceCompressionSink.h"
 
 #include <vector>
+#include <utility>
 
 #include "afv-native/Log.h"
 
@@ -55,6 +56,12 @@ VoiceCompressionSink::~VoiceCompressionSink()
 
 int VoiceCompressionSink::open()
 {
+    std::lock_guard<std::mutex> lock(mEncoderMutex);
+    return openLocked();
+}
+
+int VoiceCompressionSink::openLocked()
+{
     int opus_status = 0;
     if (mEncoder != nullptr) {
         return 0;
@@ -74,6 +81,12 @@ int VoiceCompressionSink::open()
 
 void VoiceCompressionSink::close()
 {
+    std::lock_guard<std::mutex> lock(mEncoderMutex);
+    closeLocked();
+}
+
+void VoiceCompressionSink::closeLocked()
+{
     if (nullptr != mEncoder) {
         opus_encoder_destroy(mEncoder);
         mEncoder = nullptr;
@@ -82,19 +95,27 @@ void VoiceCompressionSink::close()
 
 void VoiceCompressionSink::reset()
 {
-    close();
-    open();
+    std::lock_guard<std::mutex> lock(mEncoderMutex);
+    closeLocked();
+    openLocked();
 }
 
 void VoiceCompressionSink::putAudioFrame(const audio::SampleType *bufferIn)
 {
     vector<unsigned char> outBuffer(audio::targetOutputFrameSizeBytes);
-    auto enc_len = opus_encode_float(mEncoder, bufferIn, audio::frameSizeSamples, outBuffer.data(), outBuffer.size());
+    int enc_len;
+    {
+        std::lock_guard<std::mutex> lock(mEncoderMutex);
+        if (mEncoder == nullptr) {
+            return;
+        }
+        enc_len = opus_encode_float(mEncoder, bufferIn, audio::frameSizeSamples, outBuffer.data(), outBuffer.size());
+    }
     if (enc_len < 0) {
         LOG("VoiceCompressionSink", "error encoding frame: %s", opus_strerror(enc_len));
         return;
     }
     outBuffer.resize(enc_len);
-    mCompressedFrameSink.processCompressedFrame(outBuffer);
+    // The downstream radio may reset the codec or take its own locks.
+    mCompressedFrameSink.processCompressedFrame(std::move(outBuffer));
 }
-

@@ -74,34 +74,39 @@ defaultLogger(const char *subsystem, const char *file, int line, const char *out
 }
 
 static afv_native::log_fn  gLogger = defaultLogger;
-static std::mutex gLoggerLock;
+// Keep the callback and its context alive through invocation. Recursive locking
+// also permits a callback to log or replace itself without deadlocking.
+static std::recursive_mutex gLoggerLock;
 static void* reference = nullptr;
 
 void afv_native::__Log(const char *file, int line, const char *subsystem, const char *format, ...)
 {
-    if (gLogger == nullptr) {
-        return;
-    }
     va_list ap;
     va_list ap2;
-            va_start(ap, format);
+    va_start(ap, format);
     va_copy(ap2, ap);
-    size_t outputLen = vsnprintf(nullptr, 0, format, ap2)+1;
+    int formattedLen = vsnprintf(nullptr, 0, format, ap2);
+    va_end(ap2);
+    if (formattedLen < 0) {
+        va_end(ap);
+        return;
+    }
+    size_t outputLen = static_cast<size_t>(formattedLen) + 1;
 
     std::vector<char> outBuffer(outputLen);
     vsnprintf(outBuffer.data(), outputLen, format, ap);
+    va_end(ap);
     {
-        std::lock_guard<std::mutex> logLock(gLoggerLock);
+        std::lock_guard<std::recursive_mutex> logLock(gLoggerLock);
 
-        if(reference) {
+        if (gLogger != nullptr) {
             gLogger(subsystem, file, line, outBuffer.data(), reference);
         }
     }
-    va_end(ap2);
-    va_end(ap);
 }
 
 void afv_native::setLogger(afv_native::log_fn newLogger, void* inRef) {
+    std::lock_guard<std::recursive_mutex> logLock(gLoggerLock);
     gLogger = newLogger;
     reference = inRef;
 }
@@ -122,9 +127,9 @@ void afv_native::__Dumphex(const char *file, int line, const char *subsystem, co
             lineout << std::right << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned int>(reinterpret_cast<const uint8_t *>(buf)[i++]);
         }
         {
-            std::lock_guard<std::mutex> logLock(gLoggerLock);
+            std::lock_guard<std::recursive_mutex> logLock(gLoggerLock);
 
-            if(reference) {
+            if (gLogger != nullptr) {
                 gLogger(subsystem, file, line, lineout.str().c_str(), reference);
             }
         }

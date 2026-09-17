@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <event2/event.h>
 
@@ -53,6 +54,9 @@ namespace afv_native
         class UDPChannel : public Channel
         {
         private:
+            // Serializes capture-thread sends with socket/key changes. Event
+            // registration and teardown remain owned by the event-loop thread.
+            mutable std::recursive_mutex mChannelMutex;
             std::string mAddress;
 
             /** mDatagramRxBuffer is the channel-internal holding buffer for a
@@ -94,6 +98,7 @@ namespace afv_native
             template<class T>
             void sendDto(const T& pkt)
             {
+                std::lock_guard<std::recursive_mutex> lock(mChannelMutex);
                 if (mUDPSocket < 0)
                 {
                     LOG("UDPChannel", "tried to send on closed socket");
@@ -125,7 +130,7 @@ namespace afv_native
                     }
                     else if (sent < dgBuffer.size())
                     {
-                        LOG("udpchannel", "short write sending datagram - sent %d of %d bytes", send, dgBuffer.size());
+                        LOG("udpchannel", "short write sending datagram - sent %d of %zu bytes", static_cast<int>(sent), dgBuffer.size());
                     }
                 }
             }
