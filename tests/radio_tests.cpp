@@ -39,7 +39,7 @@ void require(bool ok, const char* expression, int line) {
 // Unlike assert(), these checks and their operands execute in Release builds.
 #define REQUIRE(expression) require(bool(expression), #expression, __LINE__)
 
-bool near(double actual, double expected, double tolerance = 0.00001) {
+bool approximatelyEqual(double actual, double expected, double tolerance = 0.00001) {
     return std::isfinite(actual) && std::fabs(actual - expected) <= tolerance;
 }
 
@@ -245,7 +245,7 @@ void loudnessConvergence() {
             levels[loud] = result.headset[0];
             const auto gain = fixture.radio->output(true);
             REQUIRE(gain.activeStreams == count);
-            REQUIRE(near(gain.gain, 1.0 / std::sqrt(double(count)), 0.0001));
+            REQUIRE(approximatelyEqual(gain.gain, 1.0 / std::sqrt(double(count)), 0.0001));
             // Startup attack may legitimately hit the limiter. Settled speech
             // must converge without clipping, including the real overlap tone.
             REQUIRE(result.limitedDuringMeasurement[0] == 0);
@@ -253,12 +253,12 @@ void loudnessConvergence() {
             REQUIRE(result.headset[0] > 0.10 && result.headset[0] < 0.21);
             for (const auto& voice : voices) {
                 const auto receive = fixture.radio->receive(voice.callsign);
-                REQUIRE(near(receive.rms * receive.gain, 0.12, 0.008));
+                REQUIRE(approximatelyEqual(receive.rms * receive.gain, 0.12, 0.008));
             }
         }
         // Same-frequency overlaps include the real 180Hz blocking tone even
         // with effects bypassed; quiet/loud runs must still converge together.
-        REQUIRE(near(levels[0] / levels[1], 1.0, 0.12));
+        REQUIRE(approximatelyEqual(levels[0] / levels[1], 1.0, 0.12));
         std::cout << "  " << count << " streams: quiet RMS=" << levels[0]
                   << ", loud RMS=" << levels[1] << '\n';
     }
@@ -277,14 +277,14 @@ void outputRouting() {
         const auto levels = run(fixture, voices);
         if (routing == 0) {
             REQUIRE(fixture.radio->output(true).activeStreams == 2);
-            REQUIRE(near(fixture.radio->output(true).gain, std::sqrt(0.5), 0.0001));
-            REQUIRE(near(levels.headset[0], 0.12, 0.012));
+            REQUIRE(approximatelyEqual(fixture.radio->output(true).gain, std::sqrt(0.5), 0.0001));
+            REQUIRE(approximatelyEqual(levels.headset[0], 0.12, 0.012));
             REQUIRE(levels.speaker[0] == 0);
         } else if (routing == 1) {
             for (unsigned ear : {0u, 1u}) {
                 REQUIRE(fixture.radio->output(true, ear).activeStreams == 1);
                 REQUIRE(fixture.radio->output(true, ear).gain == 1);
-                REQUIRE(near(levels.headset[ear], 0.12, 0.012));
+                REQUIRE(approximatelyEqual(levels.headset[ear], 0.12, 0.012));
                 REQUIRE(levels.speaker[ear] == 0);
             }
         } else {
@@ -293,8 +293,8 @@ void outputRouting() {
             REQUIRE(fixture.radio->output(false, speakerChannel).activeStreams == 1);
             REQUIRE(fixture.radio->output(true).gain == 1);
             REQUIRE(fixture.radio->output(false, speakerChannel).gain == 1);
-            REQUIRE(near(levels.headset[0], 0.12, 0.012));
-            REQUIRE(near(levels.speaker[speakerChannel], 0.12, 0.012));
+            REQUIRE(approximatelyEqual(levels.headset[0], 0.12, 0.012));
+            REQUIRE(approximatelyEqual(levels.speaker[speakerChannel], 0.12, 0.012));
             if (fixture.split) REQUIRE(levels.headset[1] == 0 && levels.speaker[0] == 0);
         }
     }
@@ -319,7 +319,7 @@ void sameCallsignOnBothRadios() {
     REQUIRE(fixture.radio->streams(true) == 1);
     REQUIRE(fixture.radio->output(true, 0).activeStreams == 1);
     REQUIRE(fixture.radio->output(true, 1).activeStreams == 1);
-    REQUIRE(near(fixture.radio->receive("DUAL").rms * fixture.radio->receive("DUAL").gain, 0.12, 0.008));
+    REQUIRE(approximatelyEqual(fixture.radio->receive("DUAL").rms * fixture.radio->receive("DUAL").gain, 0.12, 0.008));
 }
 
 void bypassAndStrengthBounds() {
@@ -383,7 +383,7 @@ void mutedRadioDoesNotDuckOtherRadio() {
     REQUIRE(muted.radio->getRxActive(1)); // The muted COM still has an active DTO stream.
     REQUIRE(muted.radio->output(true).activeStreams == 1);
     REQUIRE(muted.radio->output(true).gain == 1);
-    REQUIRE(near(muted.radio->output(true).outputRms, 0.12, 0.012));
+    REQUIRE(approximatelyEqual(muted.radio->output(true).outputRms, 0.12, 0.012));
 }
 
 void idleComChangesPreserveActiveCom() {
@@ -698,7 +698,7 @@ void concurrentCallbacksAndControls() {
     fixture.radio->setAutoOutputGainStrength(1);
     std::vector<Voice> recovery;
     recovery.emplace_back("RECOVERY", com1, 0.1f);
-    REQUIRE(near(run(fixture, recovery, 180).headset[0], 0.12, 0.012));
+    REQUIRE(approximatelyEqual(run(fixture, recovery, 180).headset[0], 0.12, 0.012));
 }
 } // namespace
 
