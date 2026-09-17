@@ -148,6 +148,7 @@ public:
     unsigned frequency;
     float amplitude;
     double tone;
+    float distanceRatio = 1.0f;
 
     Voice(std::string name, unsigned frequency, float amplitude, double tone = 700)
         : callsign(std::move(name)), frequency(frequency), amplitude(amplitude), tone(tone) {
@@ -175,7 +176,7 @@ public:
         afv::dto::RxTransceiver transceiver{};
         transceiver.ID = frequency == com2 ? 1 : 0;
         transceiver.Frequency = frequency;
-        transceiver.DistanceRatio = 1.0f;
+        transceiver.DistanceRatio = distanceRatio;
         packet.Transceivers.push_back(transceiver);
         return packet;
     }
@@ -297,6 +298,34 @@ void outputRouting() {
             REQUIRE(approximatelyEqual(levels.speaker[speakerChannel], 0.12, 0.012));
             if (fixture.split) REQUIRE(levels.headset[1] == 0 && levels.speaker[0] == 0);
         }
+    }
+}
+
+void distanceAttenuation() {
+    // Distance attenuation is part of the radio effects path. Keep effects
+    // enabled while using silent effect resources so this measures only the
+    // voice path's distance gain.
+    constexpr std::array<float, 3> distances{0.1f, 0.5f, 1.0f};
+    for (bool autoBalance : {false, true}) {
+        std::array<double, distances.size()> levels{};
+        for (std::size_t i = 0; i < distances.size(); ++i) {
+            Fixture fixture;
+            fixture.radio->setEnableOutputEffects(true);
+            fixture.radio->setAutoOutputGain(autoBalance);
+            std::vector<Voice> voices;
+            voices.emplace_back("DISTANCE", com1, 0.1f, 700);
+            voices.front().distanceRatio = distances[i];
+            levels[i] = run(fixture, voices).headset[0];
+        }
+
+        // 0.1 is the edge of reception, and 1.0 is full signal. The existing
+        // curve is approximately 0.26, 0.75 and 1.0 at these points.
+        std::cout << "  distance " << (autoBalance ? "balanced" : "raw") << ": "
+                  << levels[0] << ", " << levels[1] << ", " << levels[2] << '\n';
+        REQUIRE(levels[0] < levels[1] && levels[1] < levels[2]);
+        REQUIRE(levels[0] < levels[2] * 0.70);
+        REQUIRE(levels[1] > levels[2] * 0.55);
+        REQUIRE(levels[2] > 0.04);
     }
 }
 
@@ -708,6 +737,7 @@ int main() {
         {"zero streams / output lifetime", emptyAndDeviceLifetime},
         {"1/2/4/8 quiet and loud Opus streams", loudnessConvergence},
         {"COM1+COM2 merged / split / headset / speaker", outputRouting},
+        {"distance ratio attenuation with and without auto balance", distanceAttenuation},
         {"single callsign decoded once for both radios", sameCallsignOnBothRadios},
         {"strength zero / disabled at 100% / strength bounds", bypassAndStrengthBounds},
         {"muted COM does not attenuate audible COM", mutedRadioDoesNotDuckOtherRadio},
