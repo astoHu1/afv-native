@@ -42,6 +42,19 @@
 
 using namespace afv_native;
 
+namespace {
+void closeAudioDevice(std::shared_ptr<audio::AudioDevice>& device)
+{
+    if (!device) return;
+    device->close();
+    // Public device getters can leave an observer owning a closed device.
+    // Release callback targets before Client/event-base destruction anyway.
+    device->setSink(nullptr);
+    device->setSource(nullptr);
+    device.reset();
+}
+}
+
 Client::Client(
         struct event_base *evBase,
         unsigned int numRadios,
@@ -267,28 +280,16 @@ void Client::startAudio()
 
 void Client::stopAudio()
 {
-    if(mMicrophoneDevice) {
-        mMicrophoneDevice->close();
-        mMicrophoneDevice.reset();
-    }
+    closeAudioDevice(mMicrophoneDevice);
 
-    if(mHeadsetDevice) {
-        mHeadsetDevice->close();
-        mHeadsetDevice.reset();
-    }
+    closeAudioDevice(mHeadsetDevice);
 
-    if (mSpeakerDevice) {
-        mSpeakerDevice->close();
-        mSpeakerDevice.reset();
-    }
+    closeAudioDevice(mSpeakerDevice);
 }
 
 void Client::startMicrophone()
 {
-    if(mMicrophoneDevice) {
-        mMicrophoneDevice->close();
-        mMicrophoneDevice.reset();
-    }
+    closeAudioDevice(mMicrophoneDevice);
 
     LOG("afv::Client", "Initializing microphone device...");
 
@@ -306,8 +307,7 @@ void Client::startMicrophone()
     }
 
     if(!mMicrophoneDevice->openInput()) {
-        mMicrophoneDevice->close();
-        mMicrophoneDevice.reset();
+        closeAudioDevice(mMicrophoneDevice);
         const char* error = "Audio Error: Could not open microphone device. Please check the xPilot audio settings and try again.";
         ClientEventCallback.invokeAll(ClientEventType::AudioError, reinterpret_cast<void*>(const_cast<char*>(error)), nullptr);
         LOG("afv::Client", error);
@@ -320,10 +320,7 @@ void Client::startMicrophone()
 
 void Client::startHeadset()
 {
-    if(mHeadsetDevice) {
-        mHeadsetDevice->close();
-        mHeadsetDevice.reset();
-    }
+    closeAudioDevice(mHeadsetDevice);
 
     LOG("afv::Client", "Initializing headset device...");
 
@@ -341,8 +338,7 @@ void Client::startHeadset()
     }
 
     if(!mHeadsetDevice->openOutput()) {
-        mHeadsetDevice->close();
-        mHeadsetDevice.reset();
+        closeAudioDevice(mHeadsetDevice);
         const char* error = "Audio Error: Could not open headset device. Please check the xPilot audio settings and try again.";
         ClientEventCallback.invokeAll(ClientEventType::AudioError, reinterpret_cast<void*>(const_cast<char*>(error)), nullptr);
         LOG("afv::Client", error);
@@ -355,10 +351,7 @@ void Client::startHeadset()
 
 void Client::startSpeaker()
 {
-    if(mSpeakerDevice) {
-        mSpeakerDevice->close();
-        mSpeakerDevice.reset();
-    }
+    closeAudioDevice(mSpeakerDevice);
 
     LOG("afv::Client", "Initializing speaker device...");
 
@@ -376,8 +369,7 @@ void Client::startSpeaker()
     }
 
     if(!mSpeakerDevice->openOutput()) {
-        mSpeakerDevice->close();
-        mSpeakerDevice.reset();
+        closeAudioDevice(mSpeakerDevice);
         const char* error = "Audio Error: Could not open speaker device. Please check the xPilot audio settings and try again.";
         ClientEventCallback.invokeAll(ClientEventType::AudioError, reinterpret_cast<void*>(const_cast<char*>(error)), nullptr);
         LOG("afv::Client", error);

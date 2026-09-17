@@ -279,9 +279,16 @@ void testClient()
         auto mic = std::make_shared<FakeDevice>(client->getRadioSimulation());
         auto headset = std::make_shared<FakeDevice>(client->getRadioSimulation());
         auto speaker = std::make_shared<FakeDevice>(client->getRadioSimulation());
+        // An observer may retain a closed device beyond the Client lifetime.
+        // Its endpoint must not retain RadioSimulation's event-base timers.
+        auto simulation = std::const_pointer_cast<afv::RadioSimulation>(client->getRadioSimulation());
+        std::weak_ptr<afv::RadioSimulation> releasedSimulation = simulation;
+        mic->setSink(simulation);
+        simulation.reset();
         client->devices(mic, headset, speaker);
         client.reset();
         CHECK(mic->closes == 1 && headset->closes == 1 && speaker->closes == 1);
+        CHECK(releasedSimulation.expired());
     }
     {
         InspectableClient client(base, 2);
